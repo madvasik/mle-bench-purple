@@ -1,0 +1,30 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {},
+    required: [],
+    additionalProperties: false,
+  },
+  slots: {
+    proxy: { kind: "a2a", optional: true },
+  },
+  program: {
+    image: "ghcr.io/madvasik/mle-bench-purple:latest",
+    entrypoint: ["uv", "run", "src/server.py", "--host", "0.0.0.0", "--port", "9009"],
+    env: {
+      LOG_LEVEL: "INFO",
+    },
+    network: {
+      endpoints: [
+        { name: "endpoint", port: 9009 }
+      ]
+    }
+  },
+  provides: {
+    a2a: { kind: "a2a", endpoint: "endpoint" }
+  },
+  exports: {
+    a2a: "a2a"
+  }
+}
