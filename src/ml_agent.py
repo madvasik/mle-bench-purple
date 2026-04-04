@@ -19,6 +19,9 @@ from llm import OpenAIResponsesClient
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 4000
+MAX_READ_FILE_CHARS = 50000
+READ_FILE_SIZE_LIMIT_BYTES = 200_000
+READ_FILE_CSV_SIZE_LIMIT_BYTES = 50_000
 
 SYSTEM_PROMPT = """\
 You are an expert ML engineer solving a generic MLE-bench competition.
@@ -43,7 +46,7 @@ Environment:
 Required workflow:
 1. List files under `./home/data/` and identify relevant inputs.
 2. Read competition instructions from files such as `description.md` if present.
-3. Read the sample submission and preserve its exact columns and ordering.
+3. Inspect the sample submission and preserve its exact columns and ordering.
 4. Use `infer_tabular_task` before training to infer task type, target candidates, and validation strategy.
 5. Use `evaluate_tabular_candidates` to compare multiple validated candidates before choosing a final approach.
 6. Optionally use `generate_tabular_features`, then re-run `evaluate_tabular_candidates`.
@@ -56,7 +59,12 @@ Rules:
 - Do not use competition-specific heuristics or hardcoded assumptions about column names, targets, metrics, or feature engineering before inspecting the data.
 - Keep stdout concise. Print only the facts needed to debug progress.
 - Prefer `list_files`, `read_file`, and `inspect_csv` for exploration.
+- Never use `read_file` on large CSV files such as `train.csv`, `test.csv`, or `sample_submission.csv`; use `inspect_csv` for CSV inspection.
+- For large tabular datasets, do not run heavy full-dataset experiments before selecting 1-2 candidates.
+- For large tabular datasets, start with a subsample to choose the modeling family, then do one final fit on the full training data.
+- Avoid nested CV and avoid ensembles by default on large datasets unless there is clear evidence they are needed.
 - Prefer the structured ML/eval tools for task inference, candidate comparison, feature planning, threshold tuning, and ensembling.
+- If a structured tool returns an error for a candidate schema, do not repeat the same schema with minor variations; switch to a supported schema or use a simple `run_python` baseline.
 - Use `run_python` as the fallback and for final submission materialization, not as the first choice for model selection.
 - Prefer reliable, generic code over fragile complexity.
 - If an error occurs, inspect the traceback and fix it in the next tool call.
@@ -308,9 +316,21 @@ class MLAgent:
             raise FileNotFoundError(f"File not found: {path}")
         if not target.is_file():
             raise IsADirectoryError(f"Expected file, got directory: {path}")
+        suffix = target.suffix.lower()
+        size_bytes = target.stat().st_size
+        if suffix == ".csv" and size_bytes > READ_FILE_CSV_SIZE_LIMIT_BYTES:
+            raise ValueError(
+                f"Refusing to read large CSV file via read_file: {path} ({size_bytes} bytes). "
+                "Use inspect_csv instead."
+            )
+        if size_bytes > READ_FILE_SIZE_LIMIT_BYTES:
+            raise ValueError(
+                f"Refusing to read large file via read_file: {path} ({size_bytes} bytes). "
+                "Use inspect_csv for CSVs or request a smaller text file."
+            )
 
         text = target.read_text(encoding="utf-8")
-        return _truncate_output(text, max(200, min(max_chars, 50000)))
+        return _truncate_output(text, max(200, min(max_chars, MAX_READ_FILE_CHARS)))
 
     def _inspect_csv(self, path: str, max_rows: int = 5) -> str:
         import pandas as pd
@@ -710,6 +730,44 @@ class MLAgent:
             )
         raise ValueError(f"Unsupported candidate: {candidate_name}")
 
+    def _normalize_candidate_name(self, candidate: Any) -> str:
+        if isinstance(candidate, str):
+            raw_name = candidate
+        elif isinstance(candidate, dict):
+            raw_name = ""
+            for key in ("candidate_name", "model", "model_type", "name"):
+                value = candidate.get(key)
+                if isinstance(value, str) and value:
+                    raw_name = value
+                    break
+            if not raw_name:
+                raise ValueError(f"Unsupported candidate: {candidate}")
+        else:
+            raise ValueError(f"Unsupported candidate: {candidate}")
+
+        aliases = {
+            "logreg": "logistic_regression",
+            "logistic": "logistic_regression",
+            "logistic_regression": "logistic_regression",
+            "linear": "linear_regression",
+            "linear_regression": "linear_regression",
+            "lgbm": "lightgbm_classifier",
+            "lgbm_classifier": "lightgbm_classifier",
+            "lgbm_regressor": "lightgbm_regressor",
+            "lightgbm": "lightgbm_classifier",
+            "lightgbm_classifier": "lightgbm_classifier",
+            "lightgbm_regressor": "lightgbm_regressor",
+            "catboost": "catboost_classifier",
+            "catboost_classifier": "catboost_classifier",
+            "catboost_regressor": "catboost_regressor",
+            "xgboost": "xgboost_classifier",
+            "xgboost_classifier": "xgboost_classifier",
+            "xgboost_regressor": "xgboost_regressor",
+            "tfidf": "tfidf_linear",
+            "tfidf_linear": "tfidf_linear",
+        }
+        return aliases.get(raw_name, raw_name)
+
     def _evaluate_tabular_candidates(self, spec_json: str) -> str:
         try:
             import numpy as np
@@ -742,7 +800,8 @@ class MLAgent:
 
             y = train_eval[target_column]
             text_column = feature_summary["text_columns"][0] if feature_summary["text_columns"] else None
-            candidate_names = spec.get("candidates") or self._default_candidates(task_type, text_heavy)
+            raw_candidates = spec.get("candidates") or self._default_candidates(task_type, text_heavy)
+            candidate_names = [self._normalize_candidate_name(candidate) for candidate in raw_candidates]
             n_splits = int(spec.get("n_splits", 3))
 
             if validation_scheme == "time_split":

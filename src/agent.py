@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
-MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "24"))
+MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "12"))
 CODE_TIMEOUT = int(os.environ.get("CODE_TIMEOUT", "600"))
 
 
