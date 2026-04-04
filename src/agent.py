@@ -53,6 +53,25 @@ def _find_data_dir(workdir: Path) -> Path:
     return inner if inner.is_dir() else workdir
 
 
+def _submission_debug_summary(submission_path: Path | None) -> str:
+    if submission_path is None:
+        return "submission_path=<none>"
+    exists = submission_path.exists()
+    if not exists:
+        return f"submission_path={submission_path} exists=false"
+
+    size_bytes = submission_path.stat().st_size
+    preview = ""
+    try:
+        preview = submission_path.read_text(encoding="utf-8")[:400]
+    except Exception as exc:
+        preview = f"<failed to read preview: {exc}>"
+    return (
+        f"submission_path={submission_path} exists=true size_bytes={size_bytes}\n"
+        f"preview:\n{preview}"
+    )
+
+
 def _infer_prediction_columns(sample: pd.DataFrame, test: pd.DataFrame | None) -> list[str]:
     if test is not None:
         predicted = [col for col in sample.columns if col not in test.columns]
@@ -199,6 +218,7 @@ class Agent:
 
         with tempfile.TemporaryDirectory(prefix=f"mle-bench-{ctx}-") as temp_dir:
             work_dir = Path(temp_dir)
+            submission_path: Path | None = None
 
             try:
                 _extract_tar_b64(tar_b64, work_dir)
@@ -238,11 +258,22 @@ class Agent:
                 submission_path = await loop.run_in_executor(None, agent.run, text, loop)
                 if submission_path is None:
                     raise FileNotFoundError("Agent did not produce submission.csv")
+                logger.info("Submission candidate before normalization:\n%s", _submission_debug_summary(submission_path))
                 submission_path = normalize_submission(work_dir, submission_path)
+                logger.info("Submission candidate after normalization:\n%s", _submission_debug_summary(submission_path))
             except Exception as exc:
                 logger.exception("ML agent failed")
                 await updater.add_artifact(
-                    parts=[Part(root=TextPart(text=f"Agent error: {exc}"))],
+                    parts=[
+                        Part(
+                            root=TextPart(
+                                text=(
+                                    f"Agent error: {exc}\n\n"
+                                    f"{_submission_debug_summary(submission_path)}"
+                                )
+                            )
+                        )
+                    ],
                     name="Error",
                 )
                 return

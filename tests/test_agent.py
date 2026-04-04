@@ -16,6 +16,7 @@ from agent import (
     _find_first,
     _first_tar_from_message,
     _infer_prediction_columns,
+    _validate_submission_quality,
     _validate_column_family,
     normalize_submission,
 )
@@ -48,6 +49,14 @@ class FailingMLAgent:
 
     def run(self, instructions, loop=None):
         raise RuntimeError("boom")
+
+
+class MissingSubmissionMLAgent:
+    def __init__(self, workdir, api_key, model, max_iterations, code_timeout, updater):
+        self.workdir = Path(workdir)
+
+    def run(self, instructions, loop=None):
+        return self.workdir / "submission.csv"
 
 
 def _make_competition_tar() -> str:
@@ -214,6 +223,21 @@ async def test_agent_returns_error_when_ml_agent_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_error_artifact_includes_submission_diagnostics(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    updater = FakeUpdater()
+    agent = agent_module.Agent(ml_agent_cls=MissingSubmissionMLAgent)
+
+    await agent.run(_make_message(tar_bytes=_make_competition_tar()), updater)
+
+    assert updater.artifacts[0][0] == "Error"
+    error_text = updater.artifacts[0][1][0].root.text
+    assert "submission.csv not found" in error_text
+    assert "submission_path=" in error_text
+    assert "exists=false" in error_text
+
+
+@pytest.mark.asyncio
 async def test_agent_short_circuits_done_context(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     updater = FakeUpdater()
@@ -231,3 +255,34 @@ def test_normalize_submission_without_sample_returns_input_path(tmp_path):
     submission_path = tmp_path / "submission.csv"
     submission_path.write_text("prediction\n1\n", encoding="utf-8")
     assert normalize_submission(tmp_path, submission_path) == submission_path
+
+
+def test_validate_submission_quality_rejects_empty_missing_and_constant_predictions():
+    sample = pd.DataFrame({"id": [1, 2], "prediction": [0, 1]})
+    test = pd.DataFrame({"id": list(range(25))})
+
+    with pytest.raises(ValueError, match="submission is empty"):
+        _validate_submission_quality(pd.DataFrame(columns=["id", "prediction"]), sample, test=None)
+
+    with pytest.raises(ValueError, match="prediction column 'prediction' missing"):
+        _validate_submission_quality(pd.DataFrame({"id": [1, 2]}), sample, test=None)
+
+    constant_submission = pd.DataFrame({"id": list(range(25)), "prediction": [0] * 25})
+    sample_large = pd.DataFrame({"id": list(range(25)), "prediction": [0, 1] * 12 + [0]})
+    with pytest.raises(ValueError, match="predictions are constant"):
+        _validate_submission_quality(constant_submission, sample_large, test)
+
+
+def test_normalize_submission_raises_for_missing_file_and_row_count(tmp_path):
+    with pytest.raises(FileNotFoundError, match="submission.csv not found"):
+        normalize_submission(tmp_path, tmp_path / "submission.csv")
+
+    data_dir = tmp_path / "home" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "sample_submission.csv").write_text("id,prediction\n1,0\n2,0\n", encoding="utf-8")
+    (data_dir / "test.csv").write_text("id,feature\n1,10\n2,20\n", encoding="utf-8")
+    submission_path = tmp_path / "submission.csv"
+    submission_path.write_text("id,prediction\n1,1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="row count"):
+        normalize_submission(tmp_path, submission_path)

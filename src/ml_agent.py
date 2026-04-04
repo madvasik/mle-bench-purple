@@ -22,6 +22,9 @@ MAX_OUTPUT_CHARS = 4000
 MAX_READ_FILE_CHARS = 50000
 READ_FILE_SIZE_LIMIT_BYTES = 200_000
 READ_FILE_CSV_SIZE_LIMIT_BYTES = 50_000
+LARGE_TABULAR_ROWS = 200_000
+LARGE_TABULAR_CELLS = 5_000_000
+EVAL_SUBSAMPLE_ROWS = 120_000
 
 SYSTEM_PROMPT = """\
 You are an expert ML engineer solving a generic MLE-bench competition.
@@ -60,11 +63,14 @@ Rules:
 - Keep stdout concise. Print only the facts needed to debug progress.
 - Prefer `list_files`, `read_file`, and `inspect_csv` for exploration.
 - Never use `read_file` on large CSV files such as `train.csv`, `test.csv`, or `sample_submission.csv`; use `inspect_csv` for CSV inspection.
+- Always inspect `sample_submission.csv` with `inspect_csv`, never `read_file`.
 - For large tabular datasets, do not run heavy full-dataset experiments before selecting 1-2 candidates.
 - For large tabular datasets, start with a subsample to choose the modeling family, then do one final fit on the full training data.
+- For large tabular datasets with high-cardinality categoricals, avoid full one-hot encoding; prefer frequency/ordinal style encodings or tree-friendly pipelines.
 - Avoid nested CV and avoid ensembles by default on large datasets unless there is clear evidence they are needed.
 - Prefer the structured ML/eval tools for task inference, candidate comparison, feature planning, threshold tuning, and ensembling.
 - If a structured tool returns an error for a candidate schema, do not repeat the same schema with minor variations; switch to a supported schema or use a simple `run_python` baseline.
+- If a tool returns an error, treat it as feedback and recover in the next call instead of repeating the same mistake.
 - Use `run_python` as the fallback and for final submission materialization, not as the first choice for model selection.
 - Prefer reliable, generic code over fragile complexity.
 - If an error occurs, inspect the traceback and fix it in the next tool call.
@@ -502,10 +508,33 @@ class MLAgent:
 
     def _default_candidates(self, task_type: str, text_heavy: bool) -> list[str]:
         if task_type == "regression":
-            return ["linear_regression", "lightgbm_regressor", "catboost_regressor"]
+            return ["linear_regression", "lightgbm_regressor"]
         if text_heavy:
             return ["tfidf_linear", "logistic_regression", "lightgbm_classifier"]
-        return ["logistic_regression", "lightgbm_classifier", "catboost_classifier"]
+        return ["logistic_regression", "lightgbm_classifier"]
+
+    def _is_large_tabular_dataset(self, frame) -> bool:
+        rows = int(len(frame))
+        cols = int(len(frame.columns))
+        return rows >= LARGE_TABULAR_ROWS or rows * max(cols, 1) >= LARGE_TABULAR_CELLS
+
+    def _subsample_training_frame(self, train, target_column: str, task_type: str):
+        if not self._is_large_tabular_dataset(train) or len(train) <= EVAL_SUBSAMPLE_ROWS:
+            return train, False
+
+        if "classification" in task_type and target_column in train.columns:
+            grouped = []
+            target = train[target_column]
+            for _, group in train.groupby(target, dropna=False):
+                take = max(1, int(round(len(group) / len(train) * EVAL_SUBSAMPLE_ROWS)))
+                grouped.append(group.sample(n=min(len(group), take), random_state=42))
+            sampled = __import__("pandas").concat(grouped, axis=0).sample(frac=1.0, random_state=42)
+            if len(sampled) > EVAL_SUBSAMPLE_ROWS:
+                sampled = sampled.head(EVAL_SUBSAMPLE_ROWS)
+            return sampled.reset_index(drop=True), True
+
+        sampled = train.sample(n=EVAL_SUBSAMPLE_ROWS, random_state=42)
+        return sampled.reset_index(drop=True), True
 
     def _apply_feature_plan(self, train_df, test_df, feature_plan: dict[str, Any], target_column: str):
         import numpy as np
@@ -617,12 +646,12 @@ class MLAgent:
         from sklearn.impute import SimpleImputer
         from sklearn.linear_model import LinearRegression, LogisticRegression
         from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import OneHotEncoder, StandardScaler
-
-        import numpy as np
+        from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 
         numeric_cols = X.select_dtypes(include=["number", "bool"]).columns.tolist()
         categorical_cols = [col for col in X.columns if col not in numeric_cols]
+        large_dataset = self._is_large_tabular_dataset(X)
+        low_memory_categoricals = large_dataset or len(categorical_cols) >= 8
 
         def _tabular_preprocessor(scale_numeric: bool) -> ColumnTransformer:
             numeric_steps = [("impute", SimpleImputer(strategy="median"))]
@@ -632,22 +661,41 @@ class MLAgent:
             if numeric_cols:
                 transformers.append(("num", Pipeline(numeric_steps), numeric_cols))
             if categorical_cols:
+                cat_steps: list[tuple[str, Any]]
+                if low_memory_categoricals:
+                    cat_steps = [
+                        ("impute", SimpleImputer(strategy="most_frequent")),
+                        (
+                            "ord",
+                            OrdinalEncoder(
+                                handle_unknown="use_encoded_value",
+                                unknown_value=-1,
+                                encoded_missing_value=-1,
+                            ),
+                        ),
+                    ]
+                else:
+                    cat_steps = [
+                        ("impute", SimpleImputer(strategy="most_frequent")),
+                        (
+                            "oh",
+                            OneHotEncoder(
+                                handle_unknown="ignore",
+                                min_frequency=10 if large_dataset else None,
+                            ),
+                        ),
+                    ]
                 transformers.append(
                     (
                         "cat",
-                        Pipeline(
-                            [
-                                ("impute", SimpleImputer(strategy="most_frequent")),
-                                ("oh", OneHotEncoder(handle_unknown="ignore")),
-                            ]
-                        ),
+                        Pipeline(cat_steps),
                         categorical_cols,
                     )
                 )
             return ColumnTransformer(transformers, remainder="drop")
 
         if candidate_name == "logistic_regression":
-            estimator = LogisticRegression(max_iter=500)
+            estimator = LogisticRegression(max_iter=250, solver="lbfgs")
             return Pipeline([("pre", _tabular_preprocessor(scale_numeric=True)), ("model", estimator)])
         if candidate_name == "linear_regression":
             estimator = LinearRegression()
@@ -655,20 +703,42 @@ class MLAgent:
         if candidate_name == "lightgbm_classifier":
             from lightgbm import LGBMClassifier
 
-            estimator = LGBMClassifier(n_estimators=120, learning_rate=0.07, random_state=42, verbose=-1)
+            estimator = LGBMClassifier(
+                n_estimators=80 if large_dataset else 120,
+                learning_rate=0.07,
+                num_leaves=31,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=1,
+                random_state=42,
+                verbose=-1,
+            )
             return Pipeline([("pre", _tabular_preprocessor(scale_numeric=False)), ("model", estimator)])
         if candidate_name == "lightgbm_regressor":
             from lightgbm import LGBMRegressor
 
-            estimator = LGBMRegressor(n_estimators=120, learning_rate=0.07, random_state=42, verbose=-1)
+            estimator = LGBMRegressor(
+                n_estimators=80 if large_dataset else 120,
+                learning_rate=0.07,
+                num_leaves=31,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=1,
+                random_state=42,
+                verbose=-1,
+            )
             return Pipeline([("pre", _tabular_preprocessor(scale_numeric=False)), ("model", estimator)])
         if candidate_name == "xgboost_classifier":
             from xgboost import XGBClassifier
 
             estimator = XGBClassifier(
-                n_estimators=120,
+                n_estimators=80 if large_dataset else 120,
                 learning_rate=0.07,
-                max_depth=5,
+                max_depth=4,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=1,
+                tree_method="hist",
                 random_state=42,
                 verbosity=0,
                 eval_metric="logloss",
@@ -678,9 +748,13 @@ class MLAgent:
             from xgboost import XGBRegressor
 
             estimator = XGBRegressor(
-                n_estimators=120,
+                n_estimators=80 if large_dataset else 120,
                 learning_rate=0.07,
-                max_depth=5,
+                max_depth=4,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=1,
+                tree_method="hist",
                 random_state=42,
                 verbosity=0,
             )
@@ -689,9 +763,10 @@ class MLAgent:
             from catboost import CatBoostClassifier
 
             estimator = CatBoostClassifier(
-                iterations=120,
+                iterations=80 if large_dataset else 120,
                 learning_rate=0.07,
-                depth=6,
+                depth=5,
+                thread_count=1,
                 verbose=False,
                 allow_writing_files=False,
             )
@@ -700,9 +775,10 @@ class MLAgent:
             from catboost import CatBoostRegressor
 
             estimator = CatBoostRegressor(
-                iterations=120,
+                iterations=80 if large_dataset else 120,
                 learning_rate=0.07,
-                depth=6,
+                depth=5,
+                thread_count=1,
                 verbose=False,
                 allow_writing_files=False,
             )
@@ -779,9 +855,14 @@ class MLAgent:
             train, test, sample = self._load_tabular_bundle(spec)
             target_candidates = self._infer_target_candidates(train, test, sample)
             target_column = str(spec.get("target_column") or target_candidates[0])
+            train_eval_source, used_subsample = self._subsample_training_frame(
+                train,
+                target_column,
+                str(spec.get("task_type") or self._infer_task_type_from_target(train[target_column])),
+            )
             id_candidates = self._infer_id_candidates(train, test, sample)
             feature_summary, text_heavy, datetime_heavy = self._detect_text_datetime_features(
-                train, set(id_candidates + [target_column])
+                train_eval_source, set(id_candidates + [target_column])
             )
             task_type = str(spec.get("task_type") or self._infer_task_type_from_target(train[target_column]))
             validation_scheme = str(
@@ -791,7 +872,9 @@ class MLAgent:
             metric_family = str(spec.get("metric_family") or self._recommended_metric_family(task_type))
             feature_plan = spec.get("feature_plan") or {}
 
-            train_eval, test_eval, transforms = self._apply_feature_plan(train, test, feature_plan, target_column)
+            train_eval, test_eval, transforms = self._apply_feature_plan(
+                train_eval_source, test, feature_plan, target_column
+            )
             X = train_eval.drop(columns=[target_column], errors="ignore")
             X = X.drop(columns=[col for col in id_candidates if col in X.columns], errors="ignore")
             X_test = None
@@ -889,6 +972,8 @@ class MLAgent:
                         "feature_plan": feature_plan,
                         "target_column": target_column,
                         "id_candidates": id_candidates,
+                        "used_subsample_for_eval": used_subsample,
+                        "eval_rows": int(len(train_eval)),
                     },
                     "candidate",
                 )
@@ -918,6 +1003,8 @@ class MLAgent:
                 feature_policy={"applied": transforms, "feature_plan": feature_plan},
                 text_heavy=text_heavy,
                 datetime_heavy=datetime_heavy,
+                used_subsample_for_eval=used_subsample,
+                eval_rows=int(len(train_eval)),
             )
         except Exception as exc:
             return self._error_response(str(exc))
@@ -1021,44 +1108,56 @@ class MLAgent:
             return self._error_response(str(exc))
 
     def _execute_tool(self, call, *, iteration: int, index: int) -> str:
-        if call.name == "run_python":
-            code = str(call.arguments.get("code", ""))
-            preview = code.strip().splitlines()[0][:100] if code.strip() else "<empty>"
-            self._post_status(f"run_python: {preview}")
-            reset_session = not self._python_session_started
-            output = self._run_python(code, reset_session=reset_session)
-            self._python_session_started = True
-            return output
-        if call.name == "list_files":
-            path = str(call.arguments.get("path", "."))
-            self._post_status(f"list_files: {path}")
-            return self._list_files(path)
-        if call.name == "read_file":
-            path = str(call.arguments.get("path", ""))
-            max_chars = int(call.arguments.get("max_chars", 12000))
-            self._post_status(f"read_file: {path}")
-            return self._read_file(path, max_chars=max_chars)
-        if call.name == "inspect_csv":
-            path = str(call.arguments.get("path", ""))
-            max_rows = int(call.arguments.get("max_rows", 5))
-            self._post_status(f"inspect_csv: {path}")
-            return self._inspect_csv(path, max_rows=max_rows)
-        if call.name == "infer_tabular_task":
-            self._post_status("infer_tabular_task")
-            return self._infer_tabular_task(str(call.arguments.get("spec_json", "{}")))
-        if call.name == "evaluate_tabular_candidates":
-            self._post_status("evaluate_tabular_candidates")
-            return self._evaluate_tabular_candidates(str(call.arguments.get("spec_json", "{}")))
-        if call.name == "generate_tabular_features":
-            self._post_status("generate_tabular_features")
-            return self._generate_tabular_features(str(call.arguments.get("spec_json", "{}")))
-        if call.name == "tune_binary_threshold":
-            self._post_status("tune_binary_threshold")
-            return self._tune_binary_threshold(str(call.arguments.get("spec_json", "{}")))
-        if call.name == "build_simple_ensemble":
-            self._post_status("build_simple_ensemble")
-            return self._build_simple_ensemble(str(call.arguments.get("spec_json", "{}")))
-        raise ValueError(f"Unsupported tool call: {call.name}")
+        try:
+            if call.name == "run_python":
+                code = str(call.arguments.get("code", ""))
+                preview = code.strip().splitlines()[0][:100] if code.strip() else "<empty>"
+                self._post_status(f"run_python: {preview}")
+                reset_session = not self._python_session_started
+                output = self._run_python(code, reset_session=reset_session)
+                self._python_session_started = True
+                return output
+            if call.name == "list_files":
+                path = str(call.arguments.get("path", "."))
+                self._post_status(f"list_files: {path}")
+                return self._list_files(path)
+            if call.name == "read_file":
+                path = str(call.arguments.get("path", ""))
+                max_chars = int(call.arguments.get("max_chars", 12000))
+                self._post_status(f"read_file: {path}")
+                return self._read_file(path, max_chars=max_chars)
+            if call.name == "inspect_csv":
+                path = str(call.arguments.get("path", ""))
+                max_rows = int(call.arguments.get("max_rows", 5))
+                self._post_status(f"inspect_csv: {path}")
+                return self._inspect_csv(path, max_rows=max_rows)
+            if call.name == "infer_tabular_task":
+                self._post_status("infer_tabular_task")
+                return self._infer_tabular_task(str(call.arguments.get("spec_json", "{}")))
+            if call.name == "evaluate_tabular_candidates":
+                self._post_status("evaluate_tabular_candidates")
+                return self._evaluate_tabular_candidates(str(call.arguments.get("spec_json", "{}")))
+            if call.name == "generate_tabular_features":
+                self._post_status("generate_tabular_features")
+                return self._generate_tabular_features(str(call.arguments.get("spec_json", "{}")))
+            if call.name == "tune_binary_threshold":
+                self._post_status("tune_binary_threshold")
+                return self._tune_binary_threshold(str(call.arguments.get("spec_json", "{}")))
+            if call.name == "build_simple_ensemble":
+                self._post_status("build_simple_ensemble")
+                return self._build_simple_ensemble(str(call.arguments.get("spec_json", "{}")))
+            raise ValueError(f"Unsupported tool call: {call.name}")
+        except Exception as exc:
+            logger.warning("Tool call failed (%s): %s", call.name, exc)
+            error_hint = ""
+            if call.name == "read_file":
+                error_hint = " Use inspect_csv for CSV files, especially sample_submission.csv, train.csv, and test.csv."
+            return self._error_response(
+                str(exc) + error_hint,
+                tool_name=call.name,
+                iteration=iteration,
+                tool_index=index,
+            )
 
     def run(self, instructions: str, loop: asyncio.AbstractEventLoop | None = None) -> Path | None:
         self._loop = loop

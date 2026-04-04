@@ -20,9 +20,10 @@ def test_server_main_builds_agent_card_and_runs(monkeypatch):
             calls["request_handler"] = (agent_executor, task_store)
 
     class _FakeApp:
-        def __init__(self, agent_card, http_handler):
+        def __init__(self, agent_card, http_handler, **kwargs):
             calls["agent_card"] = agent_card
             calls["http_handler"] = http_handler
+            calls["app_kwargs"] = kwargs
 
         def build(self):
             return "built-app"
@@ -42,6 +43,7 @@ def test_server_main_builds_agent_card_and_runs(monkeypatch):
     assert calls["dotenv"] is True
     assert calls["uvicorn"] == ("built-app", "127.0.0.1", 9999)
     assert calls["request_handler"] == ("executor", "task-store")
+    assert calls["app_kwargs"] == {"max_content_length": None}
     assert calls["agent_card"].name == "Custom Agent"
     assert calls["agent_card"].description == "Custom Description"
     assert calls["agent_card"].url == "http://card"
