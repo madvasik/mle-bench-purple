@@ -1,5 +1,11 @@
 .env
+# Локальные заметки со ссылками — не пушить
+LOCAL_LINKS.md
 .venv/
 __pycache__/
-.pytest_cache/
 *.pyc
+MLE_BENCH_STUDY_LINKS.md
+submission.csv
+scripts/
+.pytest_cache/
+logs/

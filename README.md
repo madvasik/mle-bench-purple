@@ -1,34 +1,68 @@
-# MLE-Bench purple (AgentBeats)
+# MLE-Bench Purple Agent
 
-Purple agent for [MLE-bench](https://agentbeats.dev/agentbeater/mle-bench): accepts the competition `tar.gz` and benchmark instructions from the green agent ([mle-bench-green](https://github.com/RDI-Foundation/mle-bench-green)), runs a **tabular sklearn baseline** (RandomForest), returns **`submission.csv`** as an A2A file artifact.
+Это `purple`-агент для MLE-Bench / AgentBeats.
 
-No LLM API keys are required in this image. Kaggle credentials are only used by the **green** side when you Quick Submit.
+Он принимает архив соревнования `tar.gz`, распаковывает его, анализирует файлы задачи и с помощью `OpenAI gpt-5.4` строит решение, результатом которого становится `submission.csv`.
 
-## Quick Submit (AgentBeats)
+## Что делает агент
 
-- **Green secrets:** `KAGGLE_USERNAME`, `KAGGLE_KEY`
-- **Config JSON:** `{"competition_id": "spaceship-titanic"}`
+Агент работает как универсальный ML-решатель без эвристик под конкретное соревнование.
 
-Register this repo + `ghcr.io/<you>/mle-bench-purple:latest` as a purple agent; set **Amber manifest URL** to the raw `amber-manifest.json5` on `main`.
+На вход он получает:
+- архив с данными соревнования;
+- текстовые инструкции от внешнего A2A-клиента.
 
-## Local
+На выходе он возвращает:
+- `submission.csv` как A2A artifact.
 
-```bash
-uv sync
-uv run src/server.py --host 127.0.0.1 --port 9009
-```
+## Как он устроен
 
-## Docker / GHCR
+Внутри есть три основные части:
 
-```bash
-docker build -t mle-bench-purple .
-```
+- [`src/agent.py`](/Users/madvas/Documents/bonus_track_hw/mle-bench-purple/src/agent.py) — A2A-оркестратор. Принимает сообщение, извлекает архив, запускает ML-агента и отдает готовый `submission.csv`.
+- [`src/ml_agent.py`](/Users/madvas/Documents/bonus_track_hw/mle-bench-purple/src/ml_agent.py) — цикл работы LLM и основной слой инструментов. Он отправляет запросы в OpenAI, получает tool calls и шаг за шагом ведет решение задачи.
+- [`src/interpreter.py`](/Users/madvas/Documents/bonus_track_hw/mle-bench-purple/src/interpreter.py) — persistent Python interpreter. Код, который генерирует модель, выполняется в одной и той же Python-сессии, поэтому переменные, импорты и обученные объекты сохраняются между шагами.
 
-CI: push to `main` with `GHCR_WRITE_TOKEN` secret if `GITHUB_TOKEN` cannot push packages (see your τ² repo workflow).
+## Какие инструменты есть у агента
 
-## Tests
+У агента есть базовые инструменты для чтения и выполнения кода:
 
-```bash
-uv sync --extra test
-uv run pytest --agent-url http://127.0.0.1:9009
-```
+- `list_files`
+- `read_file`
+- `inspect_csv`
+- `run_python`
+
+И есть structured ML/eval инструменты для улучшения качества решения:
+
+- `infer_tabular_task` — определяет тип задачи, кандидатов на target, состав признаков и рекомендуемую validation strategy
+- `evaluate_tabular_candidates` — сравнивает несколько моделей на общей схеме валидации
+- `generate_tabular_features` — предлагает универсальные табличные преобразования признаков
+- `tune_binary_threshold` — подбирает threshold для бинарной классификации
+- `build_simple_ensemble` — проверяет простой ensemble из лучших кандидатов
+
+Эти инструменты возвращают компактный JSON и позволяют модели принимать решения не вслепую, а на основе структурированных промежуточных результатов.
+
+## Как агент работает по шагам
+
+1. Получает `competition.tar.gz`.
+2. Распаковывает архив во временную рабочую директорию.
+3. Ищет файлы соревнования, обычно в `./home/data/`.
+4. Передает задачу в LLM-агент на `gpt-5.4`.
+5. Модель сначала использует инструменты чтения файлов и анализа CSV, чтобы понять структуру задачи.
+6. Затем она вызывает structured ML/eval инструменты, чтобы:
+   определить тип tabular-задачи;
+   выбрать схему валидации;
+   сравнить несколько кандидатов;
+   при необходимости предложить feature transforms;
+   подобрать threshold;
+   проверить ensemble.
+7. Только после этого агент использует `run_python` как fallback или для финального materialization шага и записи `submission.csv`.
+8. Когда решение готово, агент ожидает файл `./submission.csv`.
+9. Если есть `sample_submission*.csv`, агент проверяет формат результата, восстанавливает недостающие служебные колонки, валидирует качество сабмита и приводит порядок колонок к sample submission.
+10. Возвращает `submission.csv` наружу через A2A.
+
+## Тесты
+
+В репозитории написано `47` тестов.
+
+Текущее покрытие тестами составляет `88%`.

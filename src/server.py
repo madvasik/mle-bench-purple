@@ -26,20 +26,20 @@ def main():
 
     skill = AgentSkill(
         id="mle_submission",
-        name="MLE-Bench submission",
+        name="Universal MLE-Bench solver",
         description=(
-            "Accepts competition.tar.gz + instructions, trains a tabular baseline, "
-            "returns submission.csv as an artifact for MLE-Bench / AgentBeats."
+            "Accepts competition.tar.gz plus instructions, uses an OpenAI-powered ML agent "
+            "to inspect the dataset, generate a submission, and returns submission.csv."
         ),
-        tags=["benchmark", "mle-bench", "kaggle", "tabular"],
+        tags=["benchmark", "mle-bench", "kaggle", "llm", "tabular"],
         examples=[],
     )
 
     agent_card = AgentCard(
-        name=os.getenv("AGENT_NAME", "MLE-Bench Tabular Purple"),
+        name=os.getenv("AGENT_NAME", "MLE-Bench Universal Purple"),
         description=os.getenv(
             "AGENT_DESCRIPTION",
-            "Sklearn RandomForest baseline for MLE-Bench (spaceship-titanic compatible)",
+            "Universal OpenAI-driven ML agent for MLE-Bench competitions",
         ),
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version="1.0.0",
@@ -56,6 +56,7 @@ def main():
     server = A2AStarletteApplication(
         agent_card=agent_card,
         http_handler=request_handler,
+        max_content_length=None,
     )
     uvicorn.run(server.build(), host=args.host, port=args.port)
 

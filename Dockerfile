@@ -5,6 +5,7 @@ USER agent
 WORKDIR /home/agent
 
 ENV PYTHONUNBUFFERED=1
+ENV OPENAI_MODEL=gpt-5.4
 
 COPY pyproject.toml uv.lock README.md ./
 COPY src src
