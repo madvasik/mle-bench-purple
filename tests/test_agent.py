@@ -16,6 +16,7 @@ from agent import (
     _find_first,
     _first_tar_from_message,
     _infer_prediction_columns,
+    _patch_submission_columns,
     _validate_submission_quality,
     _validate_column_family,
     normalize_submission,
@@ -255,6 +256,22 @@ def test_normalize_submission_without_sample_returns_input_path(tmp_path):
     submission_path = tmp_path / "submission.csv"
     submission_path.write_text("prediction\n1\n", encoding="utf-8")
     assert normalize_submission(tmp_path, submission_path) == submission_path
+
+
+def test_patch_submission_columns_restores_ids_and_prediction_name(tmp_path):
+    data_dir = tmp_path / "home" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "sample_submission.csv").write_text("id,target\n10,0\n11,0\n", encoding="utf-8")
+    (data_dir / "test.csv").write_text("id,feature\n10,1.0\n11,2.0\n", encoding="utf-8")
+    submission_path = tmp_path / "submission.csv"
+    submission_path.write_text("prediction\n1\n0\n", encoding="utf-8")
+
+    patched = _patch_submission_columns(tmp_path, submission_path)
+    frame = pd.read_csv(patched)
+
+    assert frame.columns.tolist() == ["id", "target"]
+    assert frame["id"].tolist() == [10, 11]
+    assert frame["target"].tolist() == [1, 0]
 
 
 def test_validate_submission_quality_rejects_empty_missing_and_constant_predictions():

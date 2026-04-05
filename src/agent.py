@@ -148,6 +148,49 @@ def _validate_submission_quality(
             )
 
 
+def _patch_submission_columns(workdir: Path, submission_path: Path) -> Path:
+    data_dir = _find_data_dir(workdir)
+    sample_path = _find_first(data_dir, "sample_submission*.csv")
+    test_path = _find_first(data_dir, "test*.csv")
+
+    if not submission_path.exists() or sample_path is None:
+        return submission_path
+
+    sample = pd.read_csv(sample_path)
+    submission = pd.read_csv(submission_path)
+    test = pd.read_csv(test_path) if test_path is not None else None
+
+    if len(submission) != len(sample):
+        return submission_path
+
+    missing_columns = [col for col in sample.columns if col not in submission.columns]
+    extra_columns = [col for col in submission.columns if col not in sample.columns]
+
+    expected_prediction_columns = _infer_prediction_columns(sample, test)
+    missing_prediction_columns = [col for col in expected_prediction_columns if col not in submission.columns]
+    extra_prediction_columns = [
+        col for col in extra_columns if test is None or col not in test.columns
+    ]
+
+    if len(missing_prediction_columns) == 1 and len(extra_prediction_columns) == 1:
+        submission = submission.rename(
+            columns={extra_prediction_columns[0]: missing_prediction_columns[0]}
+        )
+        missing_columns = [col for col in sample.columns if col not in submission.columns]
+
+    for col in missing_columns:
+        if test is not None and col in test.columns:
+            submission[col] = test[col].values
+        elif col in sample.columns:
+            submission[col] = sample[col].values
+
+    if all(col in submission.columns for col in sample.columns):
+        submission = submission.loc[:, sample.columns.tolist()]
+        submission.to_csv(submission_path, index=False)
+
+    return submission_path
+
+
 def normalize_submission(workdir: Path, submission_path: Path) -> Path:
     data_dir = _find_data_dir(workdir)
     sample_path = _find_first(data_dir, "sample_submission*.csv")
@@ -259,6 +302,7 @@ class Agent:
                 if submission_path is None:
                     raise FileNotFoundError("Agent did not produce submission.csv")
                 logger.info("Submission candidate before normalization:\n%s", _submission_debug_summary(submission_path))
+                submission_path = _patch_submission_columns(work_dir, submission_path)
                 submission_path = normalize_submission(work_dir, submission_path)
                 logger.info("Submission candidate after normalization:\n%s", _submission_debug_summary(submission_path))
             except Exception as exc:
