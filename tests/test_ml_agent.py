@@ -28,6 +28,14 @@ class _FakeInterpreter:
         self.calls.append((code, reset_session))
         if "write_submission" in code:
             (self.workdir / "submission.csv").write_text("id,prediction\n1,1\n", encoding="utf-8")
+        if "FINALIZE_SUBMISSION" in code:
+            sample_path = self.workdir / "home" / "data" / "sample_submission.csv"
+            candidate_path = self.workdir / "candidate.csv"
+            if sample_path.exists():
+                if candidate_path.exists():
+                    (self.workdir / "submission.csv").write_text(candidate_path.read_text(encoding="utf-8"), encoding="utf-8")
+                else:
+                    (self.workdir / "submission.csv").write_text(sample_path.read_text(encoding="utf-8"), encoding="utf-8")
         return _FakeExecutionResult(output="/tmp/file.py:1: UserWarning: noisy\n  ignore me\nreal output\n")
 
     def cleanup(self):
@@ -202,9 +210,10 @@ def test_helper_inference_methods_cover_fallback_branches(tmp_path):
 def test_prompt_mentions_structured_workflow():
     assert "infer_tabular_task" in SYSTEM_PROMPT
     assert "evaluate_tabular_candidates" in SYSTEM_PROMPT
-    assert "tune_binary_threshold" in SYSTEM_PROMPT
-    assert "build_simple_ensemble" in SYSTEM_PROMPT
-    assert "Only after structured evaluation is complete" in SYSTEM_PROMPT
+    assert "generate_tabular_features" not in SYSTEM_PROMPT
+    assert "tune_binary_threshold" not in SYSTEM_PROMPT
+    assert "build_simple_ensemble" not in SYSTEM_PROMPT
+    assert "use `run_python` to materialize the final `submission.csv`" in SYSTEM_PROMPT
     assert "avoid full one-hot encoding" in SYSTEM_PROMPT
 
 
@@ -263,37 +272,6 @@ def test_infer_tabular_task_text_heavy_contract(tmp_path):
     assert "text" in result["feature_summary"]["text_columns"]
 
 
-def test_generate_tabular_features_contract(tmp_path):
-    data_dir = tmp_path / "home" / "data"
-    data_dir.mkdir(parents=True)
-    (data_dir / "train.csv").write_text(
-        "id,amount,category,created_at,target\n1,1.0,a,2024-01-01,0\n2,10.0,b,2024-01-02,1\n3,100.0,b,2024-01-03,0\n",
-        encoding="utf-8",
-    )
-    (data_dir / "test.csv").write_text(
-        "id,amount,category,created_at\n4,5.0,a,2024-01-04\n5,50.0,b,2024-01-05\n",
-        encoding="utf-8",
-    )
-    (data_dir / "sample_submission.csv").write_text("id,target\n4,0\n5,0\n", encoding="utf-8")
-
-    agent = MLAgent(workdir=tmp_path, api_key="test-key", llm_client=_FakeLLM([]))
-    result = json.loads(
-        agent._generate_tabular_features(
-            json.dumps(
-                {
-                    "train_path": "./home/data/train.csv",
-                    "test_path": "./home/data/test.csv",
-                    "sample_submission_path": "./home/data/sample_submission.csv",
-                }
-            )
-        )
-    )
-
-    assert result["status"] == "ok"
-    assert "feature_plan" in result
-    assert "transforms_applied" in result
-
-
 def test_apply_feature_plan_adds_expected_columns(tmp_path):
     import pandas as pd
 
@@ -334,7 +312,7 @@ def test_apply_feature_plan_adds_expected_columns(tmp_path):
     assert transforms == feature_plan["transforms_applied"]
 
 
-def test_evaluate_tabular_candidates_binary_and_threshold(tmp_path):
+def test_evaluate_tabular_candidates_binary(tmp_path):
     data_dir = tmp_path / "home" / "data"
     data_dir.mkdir(parents=True)
     (data_dir / "train.csv").write_text(
@@ -365,16 +343,6 @@ def test_evaluate_tabular_candidates_binary_and_threshold(tmp_path):
     assert eval_result["status"] == "ok"
     assert eval_result["best_candidate"]["name"] in {"logistic_regression", "lightgbm_classifier"}
     assert eval_result["prediction_mode"] == "proba"
-
-    threshold_result = json.loads(
-        agent._tune_binary_threshold(
-            json.dumps({"candidate_ref": eval_result["best_candidate"]["artifact_ref"]})
-        )
-    )
-    assert threshold_result["status"] == "ok"
-    assert 0.1 <= threshold_result["best_threshold"] <= 0.9
-    assert threshold_result["best_score"] >= 0.5
-
 
 def test_evaluate_tabular_candidates_regression(tmp_path):
     data_dir = tmp_path / "home" / "data"
@@ -544,113 +512,6 @@ def test_build_candidate_model_errors_for_missing_text_and_unsupported_candidate
         agent._build_candidate_model("unknown_model", "binary_classification", X, None)
 
 
-def test_build_simple_ensemble_contract(tmp_path):
-    data_dir = tmp_path / "home" / "data"
-    data_dir.mkdir(parents=True)
-    (data_dir / "train.csv").write_text(
-        "id,x1,x2,target\n1,0.0,0.0,0\n2,0.1,0.2,0\n3,1.0,1.1,1\n4,1.2,1.0,1\n5,0.2,0.1,0\n6,1.1,1.3,1\n",
-        encoding="utf-8",
-    )
-    (data_dir / "test.csv").write_text("id,x1,x2\n7,0.05,0.1\n8,1.3,1.4\n", encoding="utf-8")
-    (data_dir / "sample_submission.csv").write_text("id,target\n7,0\n8,0\n", encoding="utf-8")
-
-    agent = MLAgent(workdir=tmp_path, api_key="test-key", llm_client=_FakeLLM([]))
-    eval_result = json.loads(
-        agent._evaluate_tabular_candidates(
-            json.dumps(
-                {
-                    "train_path": "./home/data/train.csv",
-                    "test_path": "./home/data/test.csv",
-                    "sample_submission_path": "./home/data/sample_submission.csv",
-                    "target_column": "target",
-                    "task_type": "binary_classification",
-                    "validation_scheme": "stratified_kfold",
-                    "candidates": ["logistic_regression", "lightgbm_classifier"],
-                    "n_splits": 2,
-                }
-            )
-        )
-    )
-
-    refs = [candidate["artifact_ref"] for candidate in eval_result["candidates"][:2]]
-    ensemble_result = json.loads(agent._build_simple_ensemble(json.dumps({"candidate_refs": refs, "threshold": 0.5})))
-
-    assert ensemble_result["status"] == "ok"
-    assert ensemble_result["ensemble_method"] == "average_probabilities"
-    assert ensemble_result["members"] == refs
-
-
-def test_threshold_and_ensemble_error_paths(tmp_path):
-    agent = MLAgent(workdir=tmp_path, api_key="test-key", llm_client=_FakeLLM([]))
-
-    regression_ref = agent._store_artifact(
-        {
-            "task_type": "regression",
-            "metric_family": "neg_rmse",
-            "y_true": [1.0, 2.0],
-            "oof_predictions": [1.1, 1.9],
-            "oof_probabilities": None,
-        },
-        "candidate",
-    )
-    missing_proba_ref = agent._store_artifact(
-        {
-            "task_type": "binary_classification",
-            "metric_family": "accuracy",
-            "y_true": [0, 1],
-            "oof_predictions": [0, 1],
-            "oof_probabilities": None,
-        },
-        "candidate",
-    )
-
-    wrong_task = json.loads(agent._tune_binary_threshold(json.dumps({"candidate_ref": regression_ref})))
-    no_proba = json.loads(agent._tune_binary_threshold(json.dumps({"candidate_ref": missing_proba_ref})))
-
-    assert wrong_task["status"] == "error"
-    assert "only supports binary classification" in wrong_task["error"]
-    assert no_proba["status"] == "error"
-    assert "does not contain probability outputs" in no_proba["error"]
-
-    too_few = json.loads(agent._build_simple_ensemble(json.dumps({"candidate_refs": [missing_proba_ref]})))
-    assert too_few["status"] == "error"
-    assert "at least two candidate refs" in too_few["error"]
-
-
-def test_build_simple_ensemble_supports_regression_and_multiclass(tmp_path):
-    agent = MLAgent(workdir=tmp_path, api_key="test-key", llm_client=_FakeLLM([]))
-
-    reg_ref_1 = agent._store_artifact(
-        {"task_type": "regression", "y_true": [1.0, 2.0], "oof_predictions": [1.1, 1.8]},
-        "candidate",
-    )
-    reg_ref_2 = agent._store_artifact(
-        {"task_type": "regression", "y_true": [1.0, 2.0], "oof_predictions": [0.9, 2.1]},
-        "candidate",
-    )
-    reg_result = json.loads(agent._build_simple_ensemble(json.dumps({"candidate_refs": [reg_ref_1, reg_ref_2]})))
-    assert reg_result["status"] == "ok"
-    assert reg_result["ensemble_method"] == "average_predictions"
-
-    multi_ref_1 = agent._store_artifact(
-        {"task_type": "multiclass_classification", "y_true": [0, 1, 2], "oof_predictions": [0, 1, 1]},
-        "candidate",
-    )
-    multi_ref_2 = agent._store_artifact(
-        {"task_type": "multiclass_classification", "y_true": [0, 1, 2], "oof_predictions": [0, 2, 2]},
-        "candidate",
-    )
-    multi_ref_3 = agent._store_artifact(
-        {"task_type": "multiclass_classification", "y_true": [0, 1, 2], "oof_predictions": [0, 1, 2]},
-        "candidate",
-    )
-    multi_result = json.loads(
-        agent._build_simple_ensemble(json.dumps({"candidate_refs": [multi_ref_1, multi_ref_2, multi_ref_3]}))
-    )
-    assert multi_result["status"] == "ok"
-    assert multi_result["ensemble_method"] == "majority_vote"
-
-
 def test_run_executes_tool_loop_and_returns_submission(tmp_path):
     llm = _FakeLLM(
         [
@@ -731,6 +592,24 @@ def test_run_returns_none_without_submission(tmp_path):
     assert llm.initial_calls[0]["user_input"] == "Solve the competition and produce ./submission.csv"
 
 
+def test_run_uses_deterministic_finalizer_when_submission_is_missing(tmp_path):
+    llm = _FakeLLM([_response("resp_1", text="Done")])
+    agent = MLAgent(workdir=tmp_path, api_key="test-key", llm_client=llm)
+    fake_interpreter = _FakeInterpreter(tmp_path)
+    agent.interpreter = fake_interpreter
+
+    data_dir = tmp_path / "home" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "sample_submission.csv").write_text("id,prediction\n5,0\n6,0\n", encoding="utf-8")
+    (tmp_path / "candidate.csv").write_text("id,prediction\n5,1\n6,0\n", encoding="utf-8")
+
+    result = agent.run("")
+
+    assert result == tmp_path / "submission.csv"
+    assert any("FINALIZE_SUBMISSION" in code for code, _ in fake_interpreter.calls)
+    assert (tmp_path / "submission.csv").read_text(encoding="utf-8").splitlines()[0] == "id,prediction"
+
+
 def test_execute_tool_returns_error_payload_for_large_read_file(tmp_path):
     data_dir = tmp_path / "home" / "data"
     data_dir.mkdir(parents=True)
@@ -809,7 +688,4 @@ def test_tool_spec_shape(tmp_path):
         "inspect_csv",
         "infer_tabular_task",
         "evaluate_tabular_candidates",
-        "generate_tabular_features",
-        "tune_binary_threshold",
-        "build_simple_ensemble",
     ]

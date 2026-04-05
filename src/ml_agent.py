@@ -36,9 +36,6 @@ You can use these tools:
 - `inspect_csv(path: string, max_rows?: integer)`: returns a compact JSON summary of a CSV file.
 - `infer_tabular_task(spec_json: string)`: infers target candidates, task type, feature makeup, and validation strategy.
 - `evaluate_tabular_candidates(spec_json: string)`: evaluates tabular model candidates on a single validation strategy.
-- `generate_tabular_features(spec_json: string)`: proposes generic tabular feature transforms.
-- `tune_binary_threshold(spec_json: string)`: tunes a binary classification threshold from validated probabilities.
-- `build_simple_ensemble(spec_json: string)`: validates a simple ensemble over top candidates.
 
 Environment:
 - Working directory contains the extracted competition bundle
@@ -52,11 +49,8 @@ Required workflow:
 3. Inspect the sample submission and preserve its exact columns and ordering.
 4. Use `infer_tabular_task` before training to infer task type, target candidates, and validation strategy.
 5. Use `evaluate_tabular_candidates` to compare multiple validated candidates before choosing a final approach.
-6. Optionally use `generate_tabular_features`, then re-run `evaluate_tabular_candidates`.
-7. If the task is binary classification and probability outputs are available, use `tune_binary_threshold`.
-8. If multiple candidates are close, use `build_simple_ensemble`.
-9. Only after structured evaluation is complete, use `run_python` to materialize the final `submission.csv`.
-10. Finish with a plain text response once the file is written.
+6. After choosing a simple validated approach, use `run_python` to materialize the final `submission.csv`.
+7. Finish with a plain text response once the file is written.
 
 Rules:
 - Do not use competition-specific heuristics or hardcoded assumptions about column names, targets, metrics, or feature engineering before inspecting the data.
@@ -67,8 +61,8 @@ Rules:
 - For large tabular datasets, do not run heavy full-dataset experiments before selecting 1-2 candidates.
 - For large tabular datasets, start with a subsample to choose the modeling family, then do one final fit on the full training data.
 - For large tabular datasets with high-cardinality categoricals, avoid full one-hot encoding; prefer frequency/ordinal style encodings or tree-friendly pipelines.
-- Avoid nested CV and avoid ensembles by default on large datasets unless there is clear evidence they are needed.
-- Prefer the structured ML/eval tools for task inference, candidate comparison, feature planning, threshold tuning, and ensembling.
+- Avoid nested CV and avoid ensembles by default.
+- Prefer the structured ML/eval tools for task inference and candidate comparison.
 - If a structured tool returns an error for a candidate schema, do not repeat the same schema with minor variations; switch to a supported schema or use a simple `run_python` baseline.
 - If a tool returns an error, treat it as feedback and recover in the next call instead of repeating the same mistake.
 - Use `run_python` as the fallback and for final submission materialization, not as the first choice for model selection.
@@ -240,54 +234,6 @@ class MLAgent:
                         "spec_json": {
                             "type": "string",
                             "description": "ASCII JSON spec with dataset paths, task config, candidates, and feature policy.",
-                        }
-                    },
-                    "required": ["spec_json"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "generate_tabular_features",
-                "description": "Return a generic feature plan for tabular data.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "spec_json": {
-                            "type": "string",
-                            "description": "ASCII JSON spec with dataset paths and optional target hints.",
-                        }
-                    },
-                    "required": ["spec_json"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "tune_binary_threshold",
-                "description": "Tune a threshold using validated binary probabilities.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "spec_json": {
-                            "type": "string",
-                            "description": "ASCII JSON spec with candidate_ref and optional metric settings.",
-                        }
-                    },
-                    "required": ["spec_json"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "build_simple_ensemble",
-                "description": "Evaluate a simple ensemble over validated top candidates.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "spec_json": {
-                            "type": "string",
-                            "description": "ASCII JSON spec with candidate_refs and task settings.",
                         }
                     },
                     "required": ["spec_json"],
@@ -581,64 +527,6 @@ class MLAgent:
             train[target_column] = train_df[target_column]
 
         return train, test, transforms
-
-    def _generate_tabular_features(self, spec_json: str) -> str:
-        try:
-            import pandas as pd
-
-            spec = self._parse_spec_json(spec_json)
-            train, test, sample = self._load_tabular_bundle(spec)
-            target_candidates = self._infer_target_candidates(train, test, sample)
-            target_column = str(spec.get("target_column") or target_candidates[0])
-            id_candidates = self._infer_id_candidates(train, test, sample)
-            feature_summary, text_heavy, datetime_heavy = self._detect_text_datetime_features(
-                train, set(id_candidates + [target_column])
-            )
-
-            missing_indicators = [
-                col for col in train.columns
-                if col not in id_candidates + [target_column] and float(train[col].isna().mean()) > 0.05
-            ][:10]
-            datetime_parts = feature_summary["datetime_columns"][:5]
-            log1p_columns = []
-            for col in feature_summary["numeric_columns"]:
-                series = pd.to_numeric(train[col], errors="coerce").dropna()
-                if len(series) >= 10 and (series >= 0).all():
-                    if float(series.skew()) > 1.0:
-                        log1p_columns.append(col)
-            frequency_encode = []
-            for col in feature_summary["categorical_columns"]:
-                nunique = int(train[col].nunique(dropna=True))
-                if nunique >= 10:
-                    frequency_encode.append(col)
-
-            feature_plan = {
-                "missing_indicators": missing_indicators,
-                "datetime_parts": datetime_parts,
-                "log1p_columns": log1p_columns[:10],
-                "frequency_encode": frequency_encode[:10],
-                "transforms_applied": [
-                    name
-                    for name, values in (
-                        ("missing_indicators", missing_indicators),
-                        ("datetime_parts", datetime_parts),
-                        ("log1p_columns", log1p_columns[:10]),
-                        ("frequency_encode", frequency_encode[:10]),
-                    )
-                    if values
-                ],
-            }
-            return self._ok_response(
-                task_type=str(spec.get("task_type") or self._infer_task_type_from_target(train[target_column])),
-                feature_plan=feature_plan,
-                transforms_applied=feature_plan["transforms_applied"],
-                generated_feature_families=feature_plan["transforms_applied"],
-                warnings=[],
-                text_heavy=text_heavy,
-                datetime_heavy=datetime_heavy,
-            )
-        except Exception as exc:
-            return self._error_response(str(exc))
 
     def _build_candidate_model(self, candidate_name: str, task_type: str, X, text_column: str | None):
         from sklearn.compose import ColumnTransformer
@@ -1009,104 +897,6 @@ class MLAgent:
         except Exception as exc:
             return self._error_response(str(exc))
 
-    def _tune_binary_threshold(self, spec_json: str) -> str:
-        try:
-            import numpy as np
-            from sklearn.metrics import accuracy_score
-
-            spec = self._parse_spec_json(spec_json)
-            candidate = self._load_artifact(str(spec["candidate_ref"]))
-            if candidate["task_type"] != "binary_classification":
-                return self._error_response("tune_binary_threshold only supports binary classification")
-            probabilities = candidate.get("oof_probabilities")
-            if probabilities is None:
-                return self._error_response("candidate artifact does not contain probability outputs")
-
-            y_true = np.asarray(candidate["y_true"])
-            proba = np.asarray(probabilities, dtype=float)
-            thresholds = np.linspace(float(spec.get("min_threshold", 0.1)), float(spec.get("max_threshold", 0.9)), int(spec.get("num_thresholds", 17)))
-
-            best_threshold = 0.5
-            best_score = -1.0
-            scan = []
-            for threshold in thresholds:
-                pred = (proba >= threshold).astype(int)
-                score = float(accuracy_score(y_true, pred))
-                scan.append({"threshold": float(threshold), "score": score})
-                if score >= best_score:
-                    best_score = score
-                    best_threshold = float(threshold)
-
-            return self._ok_response(
-                best_threshold=best_threshold,
-                best_score=best_score,
-                scan_summary=scan,
-                metric_family=str(spec.get("metric_family") or candidate.get("metric_family") or "accuracy"),
-                candidate_ref=str(spec["candidate_ref"]),
-            )
-        except Exception as exc:
-            return self._error_response(str(exc))
-
-    def _build_simple_ensemble(self, spec_json: str) -> str:
-        try:
-            import numpy as np
-            from sklearn.metrics import accuracy_score, mean_squared_error
-
-            spec = self._parse_spec_json(spec_json)
-            member_refs = [str(ref) for ref in spec.get("candidate_refs", [])]
-            if len(member_refs) < 2:
-                return self._error_response("build_simple_ensemble requires at least two candidate refs")
-            members = [self._load_artifact(ref) for ref in member_refs[:3]]
-            task_type = members[0]["task_type"]
-            if any(member["task_type"] != task_type for member in members):
-                return self._error_response("candidate refs must share the same task type")
-
-            y_true = np.asarray(members[0]["y_true"])
-            if task_type == "binary_classification":
-                if any(member.get("oof_probabilities") is None for member in members):
-                    return self._error_response("binary ensemble requires probability outputs")
-                stacked = np.vstack([np.asarray(member["oof_probabilities"], dtype=float) for member in members])
-                avg = stacked.mean(axis=0)
-                threshold = float(spec.get("threshold", 0.5))
-                pred = (avg >= threshold).astype(int)
-                ensemble_score = float(accuracy_score(y_true, pred))
-                best_single = max(
-                    float(accuracy_score(y_true, (np.asarray(member["oof_probabilities"], dtype=float) >= threshold).astype(int)))
-                    for member in members
-                )
-                method = "average_probabilities"
-            elif task_type == "regression":
-                stacked = np.vstack([np.asarray(member["oof_predictions"], dtype=float) for member in members])
-                avg = stacked.mean(axis=0)
-                ensemble_score = -float(mean_squared_error(y_true, avg) ** 0.5)
-                best_single = max(
-                    -float(mean_squared_error(y_true, np.asarray(member["oof_predictions"], dtype=float)) ** 0.5)
-                    for member in members
-                )
-                method = "average_predictions"
-            else:
-                stacked = np.vstack([np.asarray(member["oof_predictions"]) for member in members])
-                from collections import Counter
-
-                pred = []
-                for idx in range(stacked.shape[1]):
-                    pred.append(Counter(stacked[:, idx].tolist()).most_common(1)[0][0])
-                ensemble_score = float(accuracy_score(y_true, pred))
-                best_single = max(float(accuracy_score(y_true, member["oof_predictions"])) for member in members)
-                method = "majority_vote"
-
-            keep_ensemble = bool(ensemble_score >= best_single)
-            return self._ok_response(
-                members=member_refs[:3],
-                ensemble_method=method,
-                ensemble_score=ensemble_score,
-                keep_ensemble=keep_ensemble,
-                best_single_score=best_single,
-                task_type=task_type,
-            )
-        except Exception as exc:
-            return self._error_response(str(exc))
-
     def _execute_tool(self, call, *, iteration: int, index: int) -> str:
         try:
             if call.name == "run_python":
@@ -1137,15 +927,6 @@ class MLAgent:
             if call.name == "evaluate_tabular_candidates":
                 self._post_status("evaluate_tabular_candidates")
                 return self._evaluate_tabular_candidates(str(call.arguments.get("spec_json", "{}")))
-            if call.name == "generate_tabular_features":
-                self._post_status("generate_tabular_features")
-                return self._generate_tabular_features(str(call.arguments.get("spec_json", "{}")))
-            if call.name == "tune_binary_threshold":
-                self._post_status("tune_binary_threshold")
-                return self._tune_binary_threshold(str(call.arguments.get("spec_json", "{}")))
-            if call.name == "build_simple_ensemble":
-                self._post_status("build_simple_ensemble")
-                return self._build_simple_ensemble(str(call.arguments.get("spec_json", "{}")))
             raise ValueError(f"Unsupported tool call: {call.name}")
         except Exception as exc:
             logger.warning("Tool call failed (%s): %s", call.name, exc)
@@ -1158,6 +939,138 @@ class MLAgent:
                 iteration=iteration,
                 tool_index=index,
             )
+
+    def _finalize_submission_if_possible(self) -> Path | None:
+        submission = self.workdir / "submission.csv"
+        finalizer_code = """
+# FINALIZE_SUBMISSION
+from pathlib import Path
+import json
+import pandas as pd
+
+workdir = Path(".")
+submission_path = workdir / "submission.csv"
+data_dir = workdir / "home" / "data"
+if not data_dir.exists():
+    data_dir = workdir
+
+sample_candidates = sorted(data_dir.glob("sample_submission*.csv"))
+test_candidates = sorted(data_dir.glob("test*.csv"))
+sample_path = sample_candidates[0] if sample_candidates else None
+test_path = test_candidates[0] if test_candidates else None
+
+def _expected_rows(sample_df, test_df):
+    return len(test_df) if test_df is not None else len(sample_df)
+
+def _prediction_columns(sample_df, test_df):
+    if test_df is not None:
+        cols = [col for col in sample_df.columns if col not in test_df.columns]
+        if cols:
+            return cols
+    if len(sample_df.columns) > 1:
+        return sample_df.columns[1:].tolist()
+    return sample_df.columns.tolist()
+
+sample_df = pd.read_csv(sample_path) if sample_path is not None else None
+test_df = pd.read_csv(test_path) if test_path is not None else None
+
+if not submission_path.exists():
+    candidate_paths = []
+    for candidate in sorted(workdir.glob("*.csv")):
+        if candidate.name in {"train.csv", "test.csv", "sample_submission.csv", "submission.csv"}:
+            continue
+        candidate_paths.append(candidate)
+
+    chosen_df = None
+    if sample_df is not None:
+        expected_rows = _expected_rows(sample_df, test_df)
+        preferred_names = [
+            "submission",
+            "submission_df",
+            "predictions_df",
+            "pred_df",
+            "result_df",
+            "output_df",
+            "final_submission",
+        ]
+        namespace = globals()
+        for name in preferred_names + sorted(namespace.keys()):
+            obj = namespace.get(name)
+            if isinstance(obj, pd.DataFrame) and len(obj) == expected_rows:
+                chosen_df = obj.copy()
+                break
+        if chosen_df is None:
+            for name in ["predictions", "preds", "y_pred", "test_predictions"]:
+                obj = namespace.get(name)
+                if obj is None:
+                    continue
+                try:
+                    values = list(obj)
+                except Exception:
+                    continue
+                if len(values) == expected_rows and len(sample_df.columns) >= 2:
+                    chosen_df = sample_df.copy()
+                    chosen_df[sample_df.columns[-1]] = values
+                    break
+
+    if chosen_df is None:
+        for candidate in candidate_paths:
+            try:
+                candidate_df = pd.read_csv(candidate)
+            except Exception:
+                continue
+            if sample_df is None:
+                chosen_df = candidate_df
+                break
+            if len(candidate_df) == _expected_rows(sample_df, test_df):
+                chosen_df = candidate_df
+                break
+
+    if chosen_df is not None:
+        chosen_df.to_csv(submission_path, index=False)
+
+if submission_path.exists() and sample_df is not None:
+    submission_df = pd.read_csv(submission_path)
+    expected_rows = _expected_rows(sample_df, test_df)
+    if len(submission_df) == expected_rows:
+        missing_columns = [col for col in sample_df.columns if col not in submission_df.columns]
+        extra_columns = [col for col in submission_df.columns if col not in sample_df.columns]
+        missing_prediction_columns = [col for col in _prediction_columns(sample_df, test_df) if col not in submission_df.columns]
+        extra_prediction_columns = [col for col in extra_columns if test_df is None or col not in test_df.columns]
+        if len(missing_prediction_columns) == 1 and len(extra_prediction_columns) == 1:
+            submission_df = submission_df.rename(columns={extra_prediction_columns[0]: missing_prediction_columns[0]})
+            missing_columns = [col for col in sample_df.columns if col not in submission_df.columns]
+
+        for col in missing_columns:
+            if test_df is not None and col in test_df.columns:
+                submission_df[col] = test_df[col].values
+            elif col in sample_df.columns:
+                submission_df[col] = sample_df[col].values
+
+        if all(col in submission_df.columns for col in sample_df.columns):
+            submission_df = submission_df.loc[:, sample_df.columns.tolist()]
+            submission_df.to_csv(submission_path, index=False)
+
+summary = {
+    "exists": submission_path.exists(),
+    "path": str(submission_path),
+}
+if submission_path.exists():
+    try:
+        preview_df = pd.read_csv(submission_path)
+        summary["rows"] = int(len(preview_df))
+        summary["columns"] = preview_df.columns.tolist()
+    except Exception as exc:
+        summary["read_error"] = str(exc)
+print(json.dumps(summary, ensure_ascii=True))
+"""
+        try:
+            output = self._run_python(finalizer_code, reset_session=not self._python_session_started)
+            self._python_session_started = True
+            logger.info("Deterministic finalizer output: %s", output)
+        except Exception as exc:
+            logger.warning("Deterministic finalizer failed: %s", exc)
+        return submission if submission.exists() else None
 
     def run(self, instructions: str, loop: asyncio.AbstractEventLoop | None = None) -> Path | None:
         self._loop = loop
@@ -1200,6 +1113,11 @@ class MLAgent:
                 )
             else:
                 logger.warning("Max iterations reached without explicit finish")
+
+            submission = self.workdir / "submission.csv"
+            if not submission.exists():
+                self._post_status("Finalizing submission.csv deterministically")
+                self._finalize_submission_if_possible()
         finally:
             self.interpreter.cleanup()
 
